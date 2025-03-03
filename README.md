@@ -1,5 +1,7 @@
 # Iris Recognition System
 
+[The code still hae problems and need to be used with cautions]
+
 This is a simplified implementation of an iris recognition system, inspired by the techniques used to identify the "Afghan Girl" (Sharbat Gula) 18 years after her famous National Geographic photograph.
 
 ## How It Works
