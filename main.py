@@ -6,6 +6,13 @@ from scipy.spatial.distance import hamming
 import tkinter as tk
 from tkinter import simpledialog
 from scipy.ndimage import gaussian_filter
+import datetime
+
+def log_action(message):
+    """Log actions with timestamp and user info"""
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    user = "mmaleki92"  # Using the provided user
+    print(f"[{timestamp}] {user}: {message}")
 
 def load_and_preprocess(image_path):
     """Load image and enhance for better iris detection"""
@@ -19,7 +26,54 @@ def load_and_preprocess(image_path):
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
     
+    log_action(f"Loaded and preprocessed image: {image_path}")
     return img, enhanced
+
+def detect_eyelashes(image, iris_center, iris_radius):
+    """
+    Detect eyelashes within the iris region
+    Returns a mask where eyelashes are marked as 0
+    """
+    height, width = image.shape
+    
+    # Create a circular mask for the iris region
+    iris_mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.circle(iris_mask, iris_center, iris_radius, 255, -1)
+    
+    # Apply the mask to the image
+    iris_region = cv2.bitwise_and(image, image, mask=iris_mask)
+    
+    # Eyelashes are typically darker than iris tissue
+    # Use adaptive thresholding to identify them
+    max_value = np.max(iris_region[iris_region > 0])
+    threshold_value = max_value * 0.4  # Adjust this value as needed
+    
+    # Threshold to find dark regions (potential eyelashes)
+    _, eyelash_mask = cv2.threshold(iris_region, threshold_value, 255, cv2.THRESH_BINARY_INV)
+    
+    # Clean up the mask using morphological operations
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    eyelash_mask = cv2.morphologyEx(eyelash_mask, cv2.MORPH_OPEN, kernel)
+    
+    # Apply the iris mask again to restrict to the iris region
+    eyelash_mask = cv2.bitwise_and(eyelash_mask, iris_mask)
+    
+    # Further processing to reduce false positives
+    # Typically, eyelashes appear in the top portion of the iris
+    # Create a gradient weight that emphasizes the top of the iris
+    y_coords, x_coords = np.ogrid[:height, :width]
+    y_distance = y_coords - iris_center[1]
+    weight_mask = np.zeros((height, width), dtype=np.float32)
+    
+    # Set higher weights for the top part (negative y distance)
+    weight_mask[y_distance < 0] = 0.8
+    weight_mask[y_distance >= 0] = 0.3
+    
+    # Apply the weight mask to the eyelash mask
+    eyelash_mask = (eyelash_mask.astype(np.float32) * weight_mask).astype(np.uint8)
+    _, eyelash_mask = cv2.threshold(eyelash_mask, 120, 255, cv2.THRESH_BINARY)
+    
+    return eyelash_mask
 
 def detect_iris_boundary_from_pupil(image, pupil_center, pupil_radius, display_steps=False):
     """
@@ -300,6 +354,9 @@ def robust_iris_localization(image, min_radius=20, max_radius=150, display_steps
             pupil_center = iris_center
             pupil_radius = iris_radius // 3
     
+    # Step 9: Detect eyelashes
+    eyelash_mask = detect_eyelashes(image, iris_center, iris_radius)
+    
     # Display intermediate steps if requested
     if display_steps:
         plt.figure(figsize=(15, 10))
@@ -309,28 +366,36 @@ def robust_iris_localization(image, min_radius=20, max_radius=150, display_steps
         plt.title("Original Image")
         
         plt.subplot(2, 3, 2)
-        plt.imshow(hist_eq, cmap='gray')
-        plt.title("Histogram Equalization")
-        
-        plt.subplot(2, 3, 3)
-        plt.imshow(edges, cmap='gray')
-        plt.title("Edge Detection")
-        
-        plt.subplot(2, 3, 4)
         plt.imshow(pupil_thresh, cmap='gray')
         plt.title("Pupil Threshold")
         
-        plt.subplot(2, 3, 5)
+        plt.subplot(2, 3, 3)
+        plt.imshow(eyelash_mask, cmap='gray')
+        plt.title("Eyelash Mask")
+        
+        # Final detection with iris, pupil, and eyelashes
+        plt.subplot(2, 3, 4)
         detected = cv2.cvtColor(image.copy(), cv2.COLOR_GRAY2BGR)
+        
+        # Draw iris circle
         if iris_center and iris_radius:
             cv2.circle(detected, iris_center, iris_radius, (0, 255, 0), 2)
+        
+        # Draw pupil circle
         if pupil_center and pupil_radius:
             cv2.circle(detected, pupil_center, pupil_radius, (0, 0, 255), 2)
+        
+        # Overlay eyelash mask in blue
+        detected_copy = detected.copy()
+        detected_copy[eyelash_mask > 0] = [255, 0, 0]  # Blue for eyelashes
+        # Blend with 50% transparency
+        detected = cv2.addWeighted(detected, 0.7, detected_copy, 0.3, 0)
+        
         plt.imshow(cv2.cvtColor(detected, cv2.COLOR_BGR2RGB))
-        plt.title("Detection Result")
+        plt.title("Detection Result with Eyelashes")
         
         # Create zoomed in view
-        plt.subplot(2, 3, 6)
+        plt.subplot(2, 3, 5)
         zoom_factor = 2  # Adjust as needed
         zoom_size = int(iris_radius * zoom_factor)
         
@@ -347,14 +412,20 @@ def robust_iris_localization(image, min_radius=20, max_radius=150, display_steps
         plt.tight_layout()
         plt.show()
     
-    return iris_center, iris_radius, pupil_center, pupil_radius
+    log_action("Completed iris/pupil/eyelash detection")
+    return iris_center, iris_radius, pupil_center, pupil_radius, eyelash_mask
 
-def normalize_iris(gray, iris_center, iris_radius, pupil_center, pupil_radius):
-    """Convert iris from circular to rectangular form (rubber sheet model)"""
+def normalize_iris(gray, iris_center, iris_radius, pupil_center, pupil_radius, eyelash_mask=None):
+    """
+    Convert iris from circular to rectangular form (rubber sheet model)
+    Now handles eyelash masking
+    """
     height = 64  # Height of normalized iris image
     width = 512  # Width of normalized iris image
     
     normalized = np.zeros((height, width), dtype=np.uint8)
+    # Create a mask for the normalized iris
+    normalized_mask = np.ones((height, width), dtype=np.uint8)
     
     # Extract center coordinates
     cx_iris, cy_iris = iris_center
@@ -385,11 +456,16 @@ def normalize_iris(gray, iris_center, iris_radius, pupil_center, pupil_radius):
             xi_int, yi_int = int(round(xi)), int(round(yi))
             if 0 <= xi_int < gray.shape[1] and 0 <= yi_int < gray.shape[0]:
                 normalized[y, x] = gray[yi_int, xi_int]
+                
+                # If pixel is part of eyelash or outside iris, mark in mask
+                if eyelash_mask is not None and eyelash_mask[yi_int, xi_int] > 0:
+                    normalized_mask[y, x] = 0
     
-    return normalized
+    log_action("Normalized iris to rectangular form")
+    return normalized, normalized_mask
 
-def extract_features(normalized_iris):
-    """Extract features using Local Binary Patterns"""
+def extract_features(normalized_iris, mask=None):
+    """Extract features using Local Binary Patterns with masking"""
     radius = 3
     n_points = 8 * radius
     
@@ -400,19 +476,58 @@ def extract_features(normalized_iris):
     threshold = np.mean(lbp)
     binary_code = (lbp > threshold).astype(np.uint8)
     
-    return binary_code
-
-def calculate_hamming_distance(code1, code2):
-    """Calculate Hamming distance between two binary codes"""
-    # Flatten the codes
-    code1_flat = code1.flatten()
-    code2_flat = code2.flatten()
+    # Apply mask if provided
+    if mask is not None:
+        # Expand mask to match binary code dimensions if necessary
+        if len(binary_code.shape) > len(mask.shape):
+            expanded_mask = np.expand_dims(mask, axis=-1)
+            expanded_mask = np.repeat(expanded_mask, binary_code.shape[-1], axis=-1)
+            binary_code = binary_code * expanded_mask
     
-    # Calculate Hamming distance
-    distance = hamming(code1_flat, code2_flat)
+    log_action("Extracted iris features")
+    return binary_code, mask
+
+def calculate_hamming_distance(code1, code2, mask1=None, mask2=None):
+    """Calculate Hamming distance with masking for eyelashes"""
+    # Handle different dimensions for codes and masks
+    if len(code1.shape) > 2:
+        code1_flat = code1.flatten()
+    else:
+        code1_flat = code1.flatten()
+        
+    if len(code2.shape) > 2:
+        code2_flat = code2.flatten()
+    else:
+        code2_flat = code2.flatten()
+    
+    # Create default masks if none provided
+    if mask1 is None:
+        mask1_flat = np.ones_like(code1_flat)
+    else:
+        mask1_flat = mask1.flatten()
+        
+    if mask2 is None:
+        mask2_flat = np.ones_like(code2_flat)
+    else:
+        mask2_flat = mask2.flatten()
+    
+    # Combine masks - only consider bits where both masks are 1
+    combined_mask = mask1_flat & mask2_flat
+    
+    # Count valid bits
+    valid_bits = np.sum(combined_mask)
+    if valid_bits == 0:
+        return 1.0  # Maximum distance if no valid bits
+    
+    # Calculate Hamming distance only on valid bits
+    xor_result = np.logical_xor(code1_flat, code2_flat)
+    masked_xor = xor_result & combined_mask
+    distance = np.sum(masked_xor) / valid_bits
+    
+    log_action(f"Calculated Hamming distance: {distance:.4f}")
     return distance
 
-def find_best_match(code1, code2):
+def find_best_match(code1, code2, mask1=None, mask2=None):
     """Find best match with rotational alignment"""
     min_distance = 1.0
     best_rotation = 0
@@ -422,34 +537,38 @@ def find_best_match(code1, code2):
     for r in range(rotations):
         rotation_amount = r * (code1.shape[0] // rotations)
         rotated_code = np.roll(code2, rotation_amount, axis=0)
+        rotated_mask = None if mask2 is None else np.roll(mask2, rotation_amount, axis=0)
         
-        distance = calculate_hamming_distance(code1, rotated_code)
+        distance = calculate_hamming_distance(code1, rotated_code, mask1, rotated_mask)
         if distance < min_distance:
             min_distance = distance
             best_rotation = rotation_amount
     
+    log_action(f"Found best rotation: {best_rotation} with distance: {min_distance:.4f}")
     return min_distance, best_rotation
-
 def recognize_iris(img1_path, img2_path, display_steps=True):
     """Complete iris recognition process comparing two eye images"""
+    log_action(f"Starting iris recognition between {img1_path} and {img2_path}")
+    
     # Process first image
     img1, enhanced1 = load_and_preprocess(img1_path)
-    iris_center1, iris_radius1, pupil_center1, pupil_radius1 = robust_iris_localization(enhanced1, display_steps=display_steps)
-    normalized1 = normalize_iris(enhanced1, iris_center1, iris_radius1, pupil_center1, pupil_radius1)
-    code1 = extract_features(normalized1)
+    iris_center1, iris_radius1, pupil_center1, pupil_radius1, eyelash_mask1 = robust_iris_localization(enhanced1, display_steps=display_steps)
+    normalized1, norm_mask1 = normalize_iris(enhanced1, iris_center1, iris_radius1, pupil_center1, pupil_radius1, eyelash_mask1)
+    code1, feature_mask1 = extract_features(normalized1, norm_mask1)
     
     # Process second image
     img2, enhanced2 = load_and_preprocess(img2_path)
-    iris_center2, iris_radius2, pupil_center2, pupil_radius2 = robust_iris_localization(enhanced2, display_steps=display_steps)
-    normalized2 = normalize_iris(enhanced2, iris_center2, iris_radius2, pupil_center2, pupil_radius2)
-    code2 = extract_features(normalized2)
+    iris_center2, iris_radius2, pupil_center2, pupil_radius2, eyelash_mask2 = robust_iris_localization(enhanced2, display_steps=display_steps)
+    normalized2, norm_mask2 = normalize_iris(enhanced2, iris_center2, iris_radius2, pupil_center2, pupil_radius2, eyelash_mask2)
+    code2, feature_mask2 = extract_features(normalized2, norm_mask2)
     
     # Find best match with rotational alignment
-    distance, best_rotation = find_best_match(code1, code2)
+    distance, best_rotation = find_best_match(code1, code2, feature_mask1, feature_mask2)
     
     # Apply the best rotation for visualization
     best_rotated_normalized = np.roll(normalized2, best_rotation, axis=0)
     best_rotated_code = np.roll(code2, best_rotation, axis=0)
+    best_rotated_mask = np.roll(norm_mask2, best_rotation, axis=0) if norm_mask2 is not None else None
     
     # Visualize final results
     plt.figure(figsize=(15, 10))
@@ -459,36 +578,86 @@ def recognize_iris(img1_path, img2_path, display_steps=True):
     img1_with_circles = cv2.cvtColor(img1.copy(), cv2.COLOR_BGR2RGB)
     cv2.circle(img1_with_circles, iris_center1, iris_radius1, (0, 255, 0), 2)
     cv2.circle(img1_with_circles, pupil_center1, pupil_radius1, (255, 0, 0), 2)
+    
+    # Create proper mask for RGB image overlay
+    if eyelash_mask1 is not None:
+        # Ensure eyelash mask has same dimensions as the image (except for color channels)
+        # Fix: Create a 3D boolean mask from the 2D eyelash mask
+        eyelash_mask_3d = np.zeros_like(img1_with_circles, dtype=bool)
+        for i in range(3):  # Apply to all color channels
+            eyelash_mask_3d[:,:,i] = eyelash_mask1 > 0
+        
+        # Now apply the mask
+        img1_with_circles[eyelash_mask_3d] = [255, 0, 0]  # Blue for eyelashes
+    
     plt.imshow(img1_with_circles)
     plt.title('Image 1 Detection')
     
     # Normalized iris 1
     plt.subplot(2, 3, 2)
-    plt.imshow(normalized1, cmap='gray')
-    plt.title('Normalized Iris 1')
+    norm_vis1 = cv2.cvtColor(normalized1, cv2.COLOR_GRAY2BGR)
+    # Show mask in red overlay
+    if norm_mask1 is not None:
+        mask_indices = norm_mask1 == 0
+        mask_3d = np.zeros_like(norm_vis1, dtype=bool)
+        for i in range(3):
+            mask_3d[:,:,i] = mask_indices
+        norm_vis1[mask_3d] = [0, 0, 255]
+    
+    plt.imshow(cv2.cvtColor(norm_vis1, cv2.COLOR_BGR2RGB))
+    plt.title('Normalized Iris 1 with Mask')
     
     # IrisCode 1
     plt.subplot(2, 3, 3)
-    plt.imshow(code1, cmap='binary')
-    plt.title('IrisCode 1')
+    if len(code1.shape) > 2:
+        plt.imshow(code1[:,:,0], cmap='binary')
+        plt.title('IrisCode 1 (channel 0)')
+    else:
+        plt.imshow(code1, cmap='binary')
+        plt.title('IrisCode 1')
     
     # Second image with detection
     plt.subplot(2, 3, 4)
     img2_with_circles = cv2.cvtColor(img2.copy(), cv2.COLOR_BGR2RGB)
     cv2.circle(img2_with_circles, iris_center2, iris_radius2, (0, 255, 0), 2)
     cv2.circle(img2_with_circles, pupil_center2, pupil_radius2, (255, 0, 0), 2)
+    
+    # Create proper mask for RGB image overlay
+    if eyelash_mask2 is not None:
+        # Fix: Create a 3D boolean mask from the 2D eyelash mask
+        eyelash_mask_3d = np.zeros_like(img2_with_circles, dtype=bool)
+        for i in range(3):  # Apply to all color channels
+            eyelash_mask_3d[:,:,i] = eyelash_mask2 > 0
+        
+        # Now apply the mask
+        img2_with_circles[eyelash_mask_3d] = [255, 0, 0]  # Blue for eyelashes
+    
     plt.imshow(img2_with_circles)
     plt.title('Image 2 Detection')
     
     # Normalized iris 2
     plt.subplot(2, 3, 5)
-    plt.imshow(best_rotated_normalized, cmap='gray')
-    plt.title(f'Normalized Iris 2 (rot: {best_rotation})')
+    norm_vis2 = cv2.cvtColor(best_rotated_normalized, cv2.COLOR_GRAY2BGR)
+    
+    # Show mask in red overlay
+    if best_rotated_mask is not None:
+        mask_indices = best_rotated_mask == 0
+        mask_3d = np.zeros_like(norm_vis2, dtype=bool)
+        for i in range(3):
+            mask_3d[:,:,i] = mask_indices
+        norm_vis2[mask_3d] = [0, 0, 255]
+    
+    plt.imshow(cv2.cvtColor(norm_vis2, cv2.COLOR_BGR2RGB))
+    plt.title(f'Normalized Iris 2 with Mask (rot: {best_rotation})')
     
     # IrisCode 2
     plt.subplot(2, 3, 6)
-    plt.imshow(best_rotated_code, cmap='binary')
-    plt.title('IrisCode 2')
+    if len(best_rotated_code.shape) > 2:
+        plt.imshow(best_rotated_code[:,:,0], cmap='binary')
+        plt.title('IrisCode 2 (channel 0)')
+    else:
+        plt.imshow(best_rotated_code, cmap='binary')
+        plt.title('IrisCode 2')
     
     plt.suptitle(f'Hamming Distance: {distance:.4f}', fontsize=16)
     plt.tight_layout()
@@ -499,18 +668,22 @@ def recognize_iris(img1_path, img2_path, display_steps=True):
     print(f"Hamming Distance: {distance:.4f}")
     if distance < 0.32:
         print("SAME IRIS (high confidence)")
+        log_action("MATCH: Same iris with high confidence")
     elif distance < 0.36:
         print("LIKELY SAME IRIS (medium confidence)")
+        log_action("MATCH: Same iris with medium confidence")
     else:
         print("DIFFERENT IRISES")
+        log_action("NO MATCH: Different irises")
     
     return distance
 
 if __name__ == "__main__":
     try:
         # Replace with your image paths
-        distance = recognize_iris("different_eyes/S5018L00.jpg", "same_eyes/S5001L09.jpg")
+        distance = recognize_iris("same_eyes/S5001L00.jpg", "same_eyes/S5001L09.jpg")
         print(f"Final Hamming distance: {distance:.4f}")
         print("For reference: The Afghan Girl had Hamming Distances of 0.24 (left eye) and 0.31 (right eye).")
     except Exception as e:
         print(f"Error: {e}")
+        log_action(f"Error during iris recognition: {e}")
