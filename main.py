@@ -509,7 +509,7 @@ def recognize_iris(img1_path, img2_path, display_steps=True):
 if __name__ == "__main__":
     try:
         # Replace with your image paths
-        distance = recognize_iris("different_eyes/S5018L00.jpg", "different_eyes/S5001L00.jpg")
+        distance = recognize_iris("different_eyes/S5018L00.jpg", "same_eyes/S5001L09.jpg")
         print(f"Final Hamming distance: {distance:.4f}")
         print("For reference: The Afghan Girl had Hamming Distances of 0.24 (left eye) and 0.31 (right eye).")
     except Exception as e:
